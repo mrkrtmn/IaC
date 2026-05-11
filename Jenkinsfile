@@ -1,7 +1,6 @@
 // Pipeline para terraform: plan + apply (con aprobación manual) o destroy.
-// Corre terraform dentro de un container hashicorp/terraform usando el plugin
-// docker-workflow (docker.image().inside()), que maneja el path mapping
-// correcto incluso con docker-out-of-docker.
+// Usa el Terraform Plugin de Jenkins (tool 'terraform') — el binario lo
+// instala/cachea Jenkins en el agente automáticamente.
 
 pipeline {
     agent { label 'agent-1' }
@@ -32,11 +31,10 @@ pipeline {
     }
 
     environment {
-        AWS_CREDS_ID  = 'aws-terraform'
-        AWS_REGION    = 'us-east-1'
-        TF_IMAGE      = 'hashicorp/terraform:1.15'
+        AWS_CREDS_ID     = 'aws-terraform'
+        AWS_REGION       = 'us-east-1'
         TF_IN_AUTOMATION = 'true'
-        TF_INPUT      = 'false'
+        TF_INPUT         = 'false'
     }
 
     stages {
@@ -55,25 +53,26 @@ pipeline {
 
         stage('Terraform plan') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: env.AWS_CREDS_ID,
-                    usernameVariable: 'AWS_ACCESS_KEY_ID',
-                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                )]) {
-                    script {
-                        def destroyFlag = params.ACTION == 'destroy' ? '-destroy' : ''
-                        docker.image(env.TF_IMAGE).inside('--entrypoint=""') {
-                            sh """
-                                cd '${params.STACK}'
-                                terraform init -input=false
-                                terraform validate
-                                terraform plan ${destroyFlag} -out=tfplan -input=false
-                                terraform show -no-color tfplan > plan.txt
-                            """
+                script {
+                    def tfHome = tool name: 'terraform', type: 'org.jenkinsci.plugins.terraform.TerraformInstallation'
+                    withEnv(["PATH+TERRAFORM=${tfHome}"]) {
+                        withCredentials([usernamePassword(
+                            credentialsId: env.AWS_CREDS_ID,
+                            usernameVariable: 'AWS_ACCESS_KEY_ID',
+                            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                        )]) {
+                            def destroyFlag = params.ACTION == 'destroy' ? '-destroy' : ''
+                            dir(params.STACK) {
+                                sh "terraform version"
+                                sh "terraform init -input=false"
+                                sh "terraform validate"
+                                sh "terraform plan ${destroyFlag} -out=tfplan -input=false"
+                                sh "terraform show -no-color tfplan > plan.txt"
+                            }
                         }
                     }
-                    archiveArtifacts artifacts: "${params.STACK}/plan.txt", fingerprint: false, onlyIfSuccessful: true
                 }
+                archiveArtifacts artifacts: "${params.STACK}/plan.txt", fingerprint: false, onlyIfSuccessful: true
             }
         }
 
@@ -98,17 +97,17 @@ pipeline {
         stage('Terraform apply / destroy') {
             when { expression { params.ACTION in ['apply', 'destroy'] } }
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: env.AWS_CREDS_ID,
-                    usernameVariable: 'AWS_ACCESS_KEY_ID',
-                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                )]) {
-                    script {
-                        docker.image(env.TF_IMAGE).inside('--entrypoint=""') {
-                            sh """
-                                cd '${params.STACK}'
-                                terraform apply -input=false tfplan
-                            """
+                script {
+                    def tfHome = tool name: 'terraform', type: 'org.jenkinsci.plugins.terraform.TerraformInstallation'
+                    withEnv(["PATH+TERRAFORM=${tfHome}"]) {
+                        withCredentials([usernamePassword(
+                            credentialsId: env.AWS_CREDS_ID,
+                            usernameVariable: 'AWS_ACCESS_KEY_ID',
+                            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                        )]) {
+                            dir(params.STACK) {
+                                sh "terraform apply -input=false tfplan"
+                            }
                         }
                     }
                 }
