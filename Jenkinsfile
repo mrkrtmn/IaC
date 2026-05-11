@@ -1,6 +1,7 @@
 // Pipeline para terraform: plan + apply (con aprobación manual) o destroy.
-// Corre terraform dentro de un container Docker (hashicorp/terraform) — el
-// agente solo necesita Docker, no terraform instalado.
+// Corre terraform dentro de un container hashicorp/terraform usando el plugin
+// docker-workflow (docker.image().inside()), que maneja el path mapping
+// correcto incluso con docker-out-of-docker.
 
 pipeline {
     agent { label 'agent-1' }
@@ -52,33 +53,6 @@ pipeline {
             }
         }
 
-        stage('Terraform init') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: env.AWS_CREDS_ID,
-                    usernameVariable: 'AWS_ACCESS_KEY_ID',
-                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                )]) {
-                    sh """
-                        docker run --rm \\
-                            -v "\$(pwd)":/work -w "/work/${params.STACK}" \\
-                            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \\
-                            -e TF_IN_AUTOMATION -e TF_INPUT \\
-                            ${env.TF_IMAGE} init -input=false
-                    """
-                }
-            }
-        }
-
-        stage('Terraform validate + fmt check') {
-            steps {
-                sh """
-                    docker run --rm -v "\$(pwd)":/work -w "/work/${params.STACK}" ${env.TF_IMAGE} fmt -check -recursive -diff || true
-                    docker run --rm -v "\$(pwd)":/work -w "/work/${params.STACK}" ${env.TF_IMAGE} validate
-                """
-            }
-        }
-
         stage('Terraform plan') {
             steps {
                 withCredentials([usernamePassword(
@@ -88,17 +62,15 @@ pipeline {
                 )]) {
                     script {
                         def destroyFlag = params.ACTION == 'destroy' ? '-destroy' : ''
-                        sh """
-                            docker run --rm \\
-                                -v "\$(pwd)":/work -w "/work/${params.STACK}" \\
-                                -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \\
-                                -e TF_IN_AUTOMATION -e TF_INPUT \\
-                                ${env.TF_IMAGE} plan ${destroyFlag} -out=tfplan -input=false
-
-                            docker run --rm -v "\$(pwd)":/work -w "/work/${params.STACK}" \\
-                                -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \\
-                                ${env.TF_IMAGE} show -no-color tfplan > ${params.STACK}/plan.txt
-                        """
+                        docker.image(env.TF_IMAGE).inside('--entrypoint=""') {
+                            sh """
+                                cd '${params.STACK}'
+                                terraform init -input=false
+                                terraform validate
+                                terraform plan ${destroyFlag} -out=tfplan -input=false
+                                terraform show -no-color tfplan > plan.txt
+                            """
+                        }
                     }
                     archiveArtifacts artifacts: "${params.STACK}/plan.txt", fingerprint: false, onlyIfSuccessful: true
                 }
@@ -131,13 +103,14 @@ pipeline {
                     usernameVariable: 'AWS_ACCESS_KEY_ID',
                     passwordVariable: 'AWS_SECRET_ACCESS_KEY'
                 )]) {
-                    sh """
-                        docker run --rm \\
-                            -v "\$(pwd)":/work -w "/work/${params.STACK}" \\
-                            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \\
-                            -e TF_IN_AUTOMATION -e TF_INPUT \\
-                            ${env.TF_IMAGE} apply -input=false tfplan
-                    """
+                    script {
+                        docker.image(env.TF_IMAGE).inside('--entrypoint=""') {
+                            sh """
+                                cd '${params.STACK}'
+                                terraform apply -input=false tfplan
+                            """
+                        }
+                    }
                 }
             }
         }
