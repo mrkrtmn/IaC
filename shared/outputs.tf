@@ -8,28 +8,7 @@ output "ecs_security_group_id" { value = aws_security_group.ecs_tasks.id }
 output "task_execution_role_arn" { value = aws_iam_role.ecs_task_execution.arn }
 output "task_role_arn" { value = aws_iam_role.ecs_task.arn }
 
-# Credenciales para Jenkins (sensibles).
-# Obtener con: terraform output -raw <name>
-# Cargar en Jenkins → Credentials → AWS Credentials.
-
-output "jenkins_deploy_access_key_id" {
-  description = "Access key del IAM user botwb-jenkins (pipeline botwb-deploy, restringido a ECR+ECS)"
-  value       = aws_iam_access_key.jenkins.id
-  sensitive   = true
-}
-
-output "jenkins_deploy_secret_access_key" {
-  value     = aws_iam_access_key.jenkins.secret
-  sensitive = true
-}
-
-output "terraform_access_key_id" {
-  description = "Access key del IAM user botwb-iac-terraform (pipeline iac-apply, admin)"
-  value       = aws_iam_access_key.terraform.id
-  sensitive   = true
-}
-
-output "terraform_secret_access_key" {
-  value     = aws_iam_access_key.terraform.secret
-  sensitive = true
-}
+# Los IAM users para CI/CD (botwb-jenkins, botwb-iac-terraform) NO se manejan
+# desde terraform — viven fuera del state para evitar que un `terraform destroy`
+# del shared rompa el ciclo (Jenkins quedaría sin permisos para reaplicar).
+# Se crean con scripts/bootstrap-iam.sh.

@@ -47,23 +47,24 @@ aws dynamodb create-table --table-name tf-locks \
   --key-schema AttributeName=LockID,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST --region us-east-1
 
-# 2. Apply de shared (con creds admin locales — crea VPC, ECS, IAM users)
-cd shared
-terraform init
-terraform apply
+# 2. Bootstrap IAM users (out-of-band, una sola vez)
+./scripts/bootstrap-iam.sh
+# Imprime las access keys de botwb-jenkins y botwb-iac-terraform.
+# Cargalas en Jenkins → Credentials:
+#   - aws-jenkins   (username = access key id, password = secret) → user botwb-jenkins
+#   - aws-terraform (idem)                                        → user botwb-iac-terraform
 
-# 3. Obtener credenciales para Jenkins
-terraform output -raw terraform_access_key_id
-terraform output -raw terraform_secret_access_key
-terraform output -raw jenkins_deploy_access_key_id
-terraform output -raw jenkins_deploy_secret_access_key
+# 3. Apply de shared (desde Jenkins iac-apply con STACK=shared ACTION=apply,
+#    O local con creds admin: cd shared && terraform init && terraform apply)
 
-# 4. Cargarlas en Jenkins → Credentials:
-#    - aws-terraform (para este pipeline IaC)
-#    - aws-jenkins   (para el pipeline botwb-deploy del repo pipelines/)
-
-# 5. Apply de cada bot (desde Jenkins ya, parámetro STACK=bots/faitpro-bot, ACTION=apply)
+# 4. Apply de cada bot (desde Jenkins iac-apply con STACK=bots/<name> ACTION=apply)
 ```
+
+### ¿Por qué los IAM users no están en terraform?
+
+Si terraform los manejara, un `terraform destroy` los borraría — incluyendo el user `botwb-iac-terraform` que es **el que Jenkins usa para correr terraform**. Es el clásico "huevo-gallina": destruirías al operador en medio de la operación, y Jenkins quedaría sin permisos para volver a aplicar.
+
+Por eso los IAM users (y solo los IAM users de CI/CD) viven fuera del state, gestionados por `scripts/bootstrap-iam.sh`. Es el mismo patrón por el cual el bucket S3 + DynamoDB del backend también están fuera de terraform.
 
 ## Pipeline Jenkins (`iac-apply`)
 
