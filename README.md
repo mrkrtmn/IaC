@@ -2,6 +2,12 @@
 
 Terraform para la infra que corre los bots WhatsApp en AWS (ECS Fargate + Cloudflare Tunnel sidecar + SSM Parameter Store SecureString).
 
+## Documentación
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — diagrama de runtime, componentes, decisiones de diseño
+- [docs/RUNBOOK.md](docs/RUNBOOK.md) — operaciones diarias (deploy, rotar secrets, troubleshooting)
+- [docs/SECRETS.md](docs/SECRETS.md) — gestión de los 3 tipos de secrets (SSM, Jenkins, Meta system user)
+
 ## Estructura
 
 ```
@@ -9,7 +15,7 @@ IaC/
 ├── Jenkinsfile             # pipeline parametrizado (plan/apply/destroy por stack)
 ├── modules/
 │   └── bot-service/        # módulo reusable: ECR + SSM + Task Def + Service
-├── shared/                 # infra compartida: VPC, ECS cluster, IAM (jenkins, task, terraform-admin)
+├── shared/                 # infra compartida: VPC, ECS cluster, IAM roles
 │   ├── *.tf
 │   ├── backend.tf          # state: s3://mrkrtmn-iac-tfstate/shared/terraform.tfstate
 │   └── terraform.tfvars
@@ -18,9 +24,28 @@ IaC/
 │       ├── main.tf         # invoca module bot-service + remote_state shared
 │       ├── backend.tf      # state: s3://mrkrtmn-iac-tfstate/bots/faitpro-bot/terraform.tfstate
 │       └── terraform.tfvars
-└── scripts/
-    └── ...
+├── scripts/
+│   ├── bootstrap-iam.sh                  # crea los IAM users de CI/CD (out-of-band)
+│   └── migrate-state-from-pipelines.sh   # migración del state viejo (one-shot, ya hecha)
+├── .jenkins/
+│   └── iac-apply-config.xml              # backup del config del job Jenkins
+└── docs/
+    ├── ARCHITECTURE.md
+    ├── RUNBOOK.md
+    └── SECRETS.md
 ```
+
+## Estado actual
+
+- ✅ Backend S3 + DynamoDB
+- ✅ IAM users `botwb-jenkins` y `botwb-iac-terraform` (creados via `bootstrap-iam.sh`)
+- ✅ Stack `shared/` aplicado (VPC + ECS cluster + IAM roles)
+- ✅ Stack `bots/faitpro-bot/` aplicado (ECR + 15 SSM + task def + service)
+- ✅ Job Jenkins `iac-apply` creado y testeado end-to-end (destroy → apply funcionan)
+- ✅ Job Jenkins `botwb-deploy` (preexistente, sin cambios)
+- ✅ Bot deployado, recibiendo y respondiendo mensajes WhatsApp
+- ✅ Token Meta System User permanente (no expira)
+- ⏳ Number `+591 67045646` pendiente: bloqueado por business verification de Meta
 
 ## Backend remoto
 
@@ -28,9 +53,9 @@ IaC/
 - **DynamoDB table**: `tf-locks` (LockID partition key, PAY_PER_REQUEST)
 - Cada stack escribe a una key distinta dentro del bucket.
 
-El bootstrap del bucket+tabla está fuera de terraform (creado con awscli). Si se pierde la cuenta, recrearlo con los comandos en la sección "Bootstrap" más abajo.
+El bootstrap del bucket+tabla está fuera de terraform (creado con awscli). Si se pierde la cuenta, recrearlo con los comandos en la sección "Bootstrap desde cero".
 
-## Orden de deploy
+## Bootstrap desde cero
 
 Si arrancás desde cero (cuenta AWS limpia):
 
@@ -54,10 +79,20 @@ aws dynamodb create-table --table-name tf-locks \
 #   - aws-jenkins   (username = access key id, password = secret) → user botwb-jenkins
 #   - aws-terraform (idem)                                        → user botwb-iac-terraform
 
-# 3. Apply de shared (desde Jenkins iac-apply con STACK=shared ACTION=apply,
-#    O local con creds admin: cd shared && terraform init && terraform apply)
+# 3. Crear los jobs en Jenkins
+#   - iac-apply: Pipeline from SCM → mrkrtmn/IaC.git → Jenkinsfile (config backup en .jenkins/iac-apply-config.xml)
+#   - botwb-deploy: ya existe en mrkrtmn/pipelines.git → botwb.jenkinsfile
 
-# 4. Apply de cada bot (desde Jenkins iac-apply con STACK=bots/<name> ACTION=apply)
+# 4. Configurar Terraform tool en Jenkins
+#   Manage Jenkins → Tools → Terraform installations → Add → Name: "terraform"
+#   Install automatically → Install from Releases.hashicorp.com → version 1.15.2 linux (amd64)
+
+# 5. Apply shared (Jenkins iac-apply STACK=shared ACTION=apply)
+# 6. Apply bot (Jenkins iac-apply STACK=bots/faitpro-bot ACTION=apply)
+# 7. Setear los 15 SSM secrets (manualmente o desde un .env de backup)
+# 8. Crear tunnel en Cloudflare, setear cloudflare-tunnel-token en SSM
+# 9. botwb-deploy PROJECT=faitpro-bot
+# 10. aws ecs update-service --desired-count 1
 ```
 
 ### ¿Por qué los IAM users no están en terraform?
@@ -68,55 +103,23 @@ Por eso los IAM users (y solo los IAM users de CI/CD) viven fuera del state, ges
 
 ## Pipeline Jenkins (`iac-apply`)
 
-Pipeline con parámetros:
+Parámetros:
 - `STACK`: choice (`shared`, `bots/faitpro-bot`, …) — la carpeta a aplicar
 - `ACTION`: choice (`plan`, `apply`, `destroy`)
 - `AUTO_APPROVE`: bool (default false) — saltea el approval manual
 
 Flujo:
-1. `terraform init` (con backend S3)
-2. `terraform fmt -check` + `terraform validate`
-3. `terraform plan` (o `plan -destroy`) → guarda `tfplan` + `plan.txt` (archivado como artifact)
+1. Validar que existe el stack
+2. `terraform init` (con backend S3) usando la tool `terraform` configurada en Jenkins
+3. `terraform validate` + `plan` (o `plan -destroy`) → guarda `tfplan` + `plan.txt` (archivado como artifact)
 4. Si action ≠ plan y AUTO_APPROVE=false → **input manual** mostrando las últimas 80 líneas del plan
 5. `terraform apply tfplan`
 
 Credencial Jenkins requerida: `aws-terraform` (tipo "Username with password", username = AWS_ACCESS_KEY_ID, password = AWS_SECRET_ACCESS_KEY).
 
-## Setear secrets de un bot
-
-Después del primer `apply` de un bot, los SSM SecureString existen con valor `PLACEHOLDER_REPLACE_ME`. Rellenarlos con:
-
-```bash
-for KEY in $(terraform -chdir=bots/faitpro-bot output -json app_secret_names | jq -r '.[]'); do
-  KEY=${KEY#/faitpro-bot/}
-  read -rsp "Valor de ${KEY}: " VALUE; echo
-  aws ssm put-parameter --name "/faitpro-bot/${KEY}" --value "${VALUE}" \
-    --type SecureString --overwrite --region us-east-1
-done
-```
-
-Token del Cloudflare Tunnel (después de crear el tunnel en CF dashboard):
-```bash
-aws ssm put-parameter --name "/faitpro-bot/cloudflare-tunnel-token" \
-  --value "<token>" --type SecureString --overwrite --region us-east-1
-```
-
 ## Agregar un bot nuevo
 
-```bash
-# 1. Crear carpeta bots/<nombre>/ copiando faitpro-bot/
-cp -r bots/faitpro-bot bots/sabornacional
-cd bots/sabornacional
-
-# 2. Editar backend.tf (cambiar la key del state)
-#    bots/sabornacional/terraform.tfstate
-
-# 3. Editar terraform.tfvars (project_name, secret_keys, tenant_config)
-
-# 4. Editar Jenkinsfile en la raíz: agregar "bots/sabornacional" al choice del param STACK
-
-# 5. Commit + push, desde Jenkins correr el pipeline con STACK=bots/sabornacional ACTION=apply
-```
+Ver [docs/ARCHITECTURE.md → Multi-tenancy](docs/ARCHITECTURE.md#multi-tenancy) para el paso a paso.
 
 ## Costo estimado por bot (24/7)
 
@@ -132,3 +135,9 @@ cd bots/sabornacional
 | **Total estimado por bot** | **~$13** |
 
 VPC, ECS cluster, IAM users, IGW: $0.
+
+## Repos relacionados
+
+- **`mrkrtmn/IaC`** (este repo) — infraestructura AWS via terraform
+- **`mrkrtmn/pipelines`** — Jenkinsfile de deploy de bots (`botwb.jenkinsfile`) + `projects.groovy`
+- **`mrkrtmn/FAITPro-bot`** — código del bot (Python + FastAPI)
