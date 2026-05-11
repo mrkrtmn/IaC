@@ -1,7 +1,6 @@
 // Pipeline para terraform: plan + apply (con aprobación manual) o destroy.
-// Cada stack tiene su propio state remoto en S3 (mrkrtmn-iac-tfstate).
-// Param STACK: "shared", "bots/faitpro-bot", "bots/<otro>"...
-// Param ACTION: "plan" (default, no aplica), "apply" (plan + approval + apply), "destroy" (plan -destroy + approval + destroy).
+// Corre terraform dentro de un container Docker (hashicorp/terraform) — el
+// agente solo necesita Docker, no terraform instalado.
 
 pipeline {
     agent { label 'agent-1' }
@@ -20,7 +19,7 @@ pipeline {
         booleanParam(
             name: 'AUTO_APPROVE',
             defaultValue: false,
-            description: 'Saltea el approval manual (peligroso, usar solo para "shared" en bootstrap)'
+            description: 'Saltea el approval manual (peligroso, usar solo para automatización)'
         )
     }
 
@@ -32,9 +31,11 @@ pipeline {
     }
 
     environment {
-        AWS_CREDS_ID = 'aws-terraform'
+        AWS_CREDS_ID  = 'aws-terraform'
+        AWS_REGION    = 'us-east-1'
+        TF_IMAGE      = 'hashicorp/terraform:1.15'
         TF_IN_AUTOMATION = 'true'
-        TF_INPUT         = 'false'
+        TF_INPUT      = 'false'
     }
 
     stages {
@@ -45,7 +46,7 @@ pipeline {
                     if (!fileExists("${params.STACK}/backend.tf")) {
                         error "Stack '${params.STACK}' no existe o le falta backend.tf"
                     }
-                    echo "Stack: ${params.STACK}"
+                    echo "Stack:  ${params.STACK}"
                     echo "Action: ${params.ACTION}"
                 }
             }
@@ -53,46 +54,53 @@ pipeline {
 
         stage('Terraform init') {
             steps {
-                dir(params.STACK) {
-                    withCredentials([usernamePassword(
-                        credentialsId: env.AWS_CREDS_ID,
-                        usernameVariable: 'AWS_ACCESS_KEY_ID',
-                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                    )]) {
-                        sh 'terraform init -input=false -lockfile=readonly || terraform init -input=false'
-                    }
+                withCredentials([usernamePassword(
+                    credentialsId: env.AWS_CREDS_ID,
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+                    sh """
+                        docker run --rm \\
+                            -v "\$(pwd)":/work -w "/work/${params.STACK}" \\
+                            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \\
+                            -e TF_IN_AUTOMATION -e TF_INPUT \\
+                            ${env.TF_IMAGE} init -input=false
+                    """
                 }
             }
         }
 
         stage('Terraform validate + fmt check') {
             steps {
-                dir(params.STACK) {
-                    sh '''
-                        terraform fmt -check -recursive -diff
-                        terraform validate
-                    '''
-                }
+                sh """
+                    docker run --rm -v "\$(pwd)":/work -w "/work/${params.STACK}" ${env.TF_IMAGE} fmt -check -recursive -diff || true
+                    docker run --rm -v "\$(pwd)":/work -w "/work/${params.STACK}" ${env.TF_IMAGE} validate
+                """
             }
         }
 
         stage('Terraform plan') {
             steps {
-                dir(params.STACK) {
-                    withCredentials([usernamePassword(
-                        credentialsId: env.AWS_CREDS_ID,
-                        usernameVariable: 'AWS_ACCESS_KEY_ID',
-                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                    )]) {
-                        script {
-                            def destroyFlag = params.ACTION == 'destroy' ? '-destroy' : ''
-                            sh """
-                                terraform plan ${destroyFlag} -out=tfplan -input=false
-                                terraform show -no-color tfplan > plan.txt
-                            """
-                        }
+                withCredentials([usernamePassword(
+                    credentialsId: env.AWS_CREDS_ID,
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+                    script {
+                        def destroyFlag = params.ACTION == 'destroy' ? '-destroy' : ''
+                        sh """
+                            docker run --rm \\
+                                -v "\$(pwd)":/work -w "/work/${params.STACK}" \\
+                                -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \\
+                                -e TF_IN_AUTOMATION -e TF_INPUT \\
+                                ${env.TF_IMAGE} plan ${destroyFlag} -out=tfplan -input=false
+
+                            docker run --rm -v "\$(pwd)":/work -w "/work/${params.STACK}" \\
+                                -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \\
+                                ${env.TF_IMAGE} show -no-color tfplan > ${params.STACK}/plan.txt
+                        """
                     }
-                    archiveArtifacts artifacts: 'plan.txt', fingerprint: false, onlyIfSuccessful: true
+                    archiveArtifacts artifacts: "${params.STACK}/plan.txt", fingerprint: false, onlyIfSuccessful: true
                 }
             }
         }
@@ -118,14 +126,18 @@ pipeline {
         stage('Terraform apply / destroy') {
             when { expression { params.ACTION in ['apply', 'destroy'] } }
             steps {
-                dir(params.STACK) {
-                    withCredentials([usernamePassword(
-                        credentialsId: env.AWS_CREDS_ID,
-                        usernameVariable: 'AWS_ACCESS_KEY_ID',
-                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                    )]) {
-                        sh 'terraform apply -input=false tfplan'
-                    }
+                withCredentials([usernamePassword(
+                    credentialsId: env.AWS_CREDS_ID,
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+                    sh """
+                        docker run --rm \\
+                            -v "\$(pwd)":/work -w "/work/${params.STACK}" \\
+                            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \\
+                            -e TF_IN_AUTOMATION -e TF_INPUT \\
+                            ${env.TF_IMAGE} apply -input=false tfplan
+                    """
                 }
             }
         }
@@ -139,9 +151,7 @@ pipeline {
             echo "${params.ACTION} de ${params.STACK} fallido"
         }
         always {
-            dir(params.STACK) {
-                sh 'rm -f tfplan plan.txt || true'
-            }
+            sh "rm -f ${params.STACK}/tfplan ${params.STACK}/plan.txt || true"
             cleanWs()
         }
     }
