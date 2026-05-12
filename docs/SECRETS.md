@@ -172,6 +172,54 @@ Trade-offs evaluados:
 | Secretos en imagen Docker | ✓ Nunca tocan la imagen | ⚠️ Si se pasan como env vars en docker build, sí |
 | Visibilidad fuera de Jenkins | ✓ awscli, consola | ✗ Sólo Jenkins UI/API |
 
+## Activar un número real en Cloud API (no test number)
+
+Los números de prueba que Meta provee (`+1 555-...`) están pre-registrados y funcionan en development mode. Para usar un **número real verificado** hay que:
+
+### Pre-requisitos
+
+1. **WABA con el número real** ya creado en Meta Business Manager
+2. **Número verificado** (recibió SMS con código y se ingresó → `code_verification_status: VERIFIED`)
+3. **App Meta publicada** (no en "development mode")
+4. **System User token** con scope sobre el WABA
+
+### Pasos
+
+```bash
+TOKEN=$(aws ssm get-parameter --name "/faitpro-bot/META_ACCESS_TOKEN" --with-decryption --region us-east-1 --query 'Parameter.Value' --output text)
+
+# 1. Suscribir la app al WABA (solo necesario una vez por WABA nuevo)
+curl -sS -X POST "https://graph.facebook.com/v25.0/<WABA_ID>/subscribed_apps?access_token=$TOKEN"
+
+# 2. Verificar que la suscripción está OK
+curl -sS "https://graph.facebook.com/v25.0/<WABA_ID>/subscribed_apps?access_token=$TOKEN"
+# debería devolver { data: [{ whatsapp_business_api_data: { name: "FAITPro Bot", ... } }] }
+
+# 3. Registrar el phone number en Cloud API con un PIN nuevo de 6 dígitos
+curl -sS -X POST "https://graph.facebook.com/v25.0/<PHONE_NUMBER_ID>/register" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"messaging_product":"whatsapp","pin":"<PIN_6_DIGITOS>"}'
+# Esperar: {"success": true}
+
+# 4. Verificar que está CONNECTED
+curl -sS "https://graph.facebook.com/v25.0/<PHONE_NUMBER_ID>?access_token=$TOKEN&fields=status,platform_type,throughput"
+# Esperar:
+# "status": "CONNECTED"
+# "platform_type": "CLOUD_API"
+# "throughput": { "level": "STANDARD" }
+```
+
+### Anotar el PIN
+
+⚠️ El PIN que pasás en el `register` queda asociado al phone number. Si Meta pide re-register en el futuro (rotación, cambio de provider, etc.), hay que usar **el mismo PIN**. Si lo perdés, hay un flow de recovery pero es engorroso.
+
+### Faitpro — datos actuales
+
+- Phone Number ID: `1088935560976390` (`+591 67045646`)
+- WABA: `1315055643906907`
+- PIN Cloud API: ver `FAITPro-bot/CLAUDE.md` sección "Infraestructura"
+
 ## srv05 — legacy
 
 El `.env.faitpro` en `~/actions-runner-faitpro/_work/FAITPro-bot/FAITPro-bot/.env.faitpro` en srv05 **ya no se usa** desde que migramos a AWS. Se conservó porque sirvió de fuente para el primer poblado de SSM. Puede borrarse cuando se quiera. Si se borra, los valores siguen en SSM (no se pierde nada).
